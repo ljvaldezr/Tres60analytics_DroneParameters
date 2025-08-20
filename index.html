@@ -1,0 +1,335 @@
+# Re-emit the standalone HTML file so the user can download it again
+html_content = r"""
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Planificador de vuelo y cámara • DJI P4P / M3 Multispectral</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useMemo, useState } = React;
+
+      const clamp = (x, min, max) => Math.max(min, Math.min(max, x));
+      const log2 = (x) => Math.log(x) / Math.log(2);
+
+      function parseShutter(value) {
+        if (typeof value === "number") return value;
+        if (!value) return 0.001;
+        const v = value.toString().trim().toLowerCase();
+        if (v.endsWith("s") && v.includes("/")) {
+          const frac = v.replace("s", "").split("/");
+          const num = parseFloat(frac[0]);
+          const den = parseFloat(frac[1]);
+          if (!isNaN(num) && !isNaN(den) && den !== 0) return num / den;
+        }
+        if (v.includes("/")) {
+          const [num, den] = v.split("/").map(parseFloat);
+          if (!isNaN(num) && !isNaN(den) && den !== 0) return num / den;
+        }
+        if (v.endsWith("ms")) {
+          const ms = parseFloat(v.replace("ms", ""));
+          if (!isNaN(ms)) return ms / 1000;
+        }
+        const num = parseFloat(v);
+        if (!isNaN(num)) return num;
+        return 0.001;
+      }
+
+      function formatShutterSeconds(t) {
+        if (!t) return "1/1000";
+        if (t >= 1) return `${t.toFixed(2)} s`;
+        const inv = 1 / t;
+        const candidates = [2,3,4,5,6,8,10,12,15,20,25,30,40,50,60,80,100,125,160,200,250,320,400,500,640,800,1000,1250,1600,2000,2500,3200,4000,8000];
+        let best = candidates.reduce((a, b) => (Math.abs(b - inv) < Math.abs(a - inv) ? b : a));
+        return `1/${best}`;
+      }
+
+      const EV100_PRESETS = {
+        "Nieve/Arena sol fuerte": 16,
+        "Soleado (sombras definidas)": 15,
+        "Soleado con bruma": 14,
+        "Nublado brillante (sin sombras)": 13,
+        "Nublado espeso / sombra": 12,
+        "Amanecer/Atardecer": 11,
+      };
+
+      const CAMERAS = {
+        P4P: {
+          id: "P4P",
+          label: "DJI Phantom 4 Pro (RGB)",
+          imageWidthPx: 5472,
+          sensorWidthMm: 13.2,
+          focalMm: 8.8,
+          aspect: "3:2",
+          mechShutter: true,
+          sweetSpotF: 5.6,
+          sweetSigma: 0.5,
+        },
+        M3M_RGB: {
+          id: "M3M_RGB",
+          label: "DJI Mavic 3 Multispectral (RGB)",
+          imageWidthPx: 5280,
+          sensorWidthMm: 17.3,
+          focalMm: 12.0,
+          aspect: "4:3",
+          mechShutter: true,
+          sweetSpotF: 6.3,
+          sweetSigma: 0.55,
+        },
+        M3M_MS: {
+          id: "M3M_MS",
+          label: "DJI Mavic 3 Multispectral (Multiespectral)",
+          imageWidthPx: 2592,
+          aspect: "4:3",
+          mechShutter: false,
+          fovHdeg: 61.2,
+          fixedF: 2.0,
+          sweetSpotF: 2.0,
+          sweetSigma: 0.35,
+        },
+      };
+
+      const SHUTTER_OPTIONS = [
+        "1/30","1/40","1/50","1/60","1/80","1/100","1/125","1/160","1/200","1/250",
+        "1/320","1/400","1/500","1/640","1/800","1/1000","1/1250","1/1600","1/2000",
+        "1/2500","1/3200","1/4000","1/8000"
+      ];
+
+      function apertureListFor(model){
+        return model === "M3M_MS"
+          ? [2.0]
+          : [2.8,3.2,3.5,4.0,4.5,5.0,5.6,6.3,7.1,8.0,9.0,10.0,11.0];
+      }
+
+      function pixelPitchMm(cam) {
+        if (!cam.sensorWidthMm) return null;
+        return cam.sensorWidthMm / cam.imageWidthPx;
+      }
+
+      function heightFromGSD(gsdCm, cam) {
+        const gsdM = gsdCm / 100.0;
+        if (cam.id === "M3M_MS") {
+          const fovHrad = (cam.fovHdeg * Math.PI) / 180;
+          const H = (gsdM * cam.imageWidthPx) / (2 * Math.tan(fovHrad / 2));
+          return H;
+        } else {
+          const pp = pixelPitchMm(cam);
+          const f = cam.focalMm;
+          const H = gsdM * (f / pp);
+          return H;
+        }
+      }
+
+      function recommendedISO(N, t, ev100) {
+        const iso = 100 * (N * N / t) / Math.pow(2, ev100);
+        return clamp(iso, 50, 12800);
+      }
+
+      function evCompSuggestion(N, t, ev100, preferUnder = true) {
+        const evCombo100 = log2((N * N) / t);
+        let comp = ev100 - evCombo100;
+        if (preferUnder) comp -= 0.3;
+        return comp;
+      }
+
+      function maxSpeedForBlur(gsdCm, t, pxBudget = 1/3) {
+        const gsdM = gsdCm / 100.0;
+        return (pxBudget * gsdM) / t;
+      }
+
+      function apertureScore(N, cam) {
+        const ideal = cam.sweetSpotF || 5.6;
+        const sigma = cam.sweetSigma || 0.5;
+        const delta = Math.abs(log2(N / ideal));
+        const score = 10 * Math.exp(-(delta * delta) / (2 * sigma * sigma));
+        if (N > 8) {
+          return score * Math.exp(-((N - 8) / 4));
+        }
+        return score;
+      }
+
+      function shutterScore(vmax) {
+        const minV = 0.5, maxV = 7;
+        const s = ((vmax - minV) / (maxV - minV)) * 10;
+        return clamp(s, 0, 10);
+      }
+
+      function isoPenalty(iso) {
+        if (iso <= 400) return 0;
+        if (iso <= 800) return 0.25;
+        if (iso <= 1600) return 0.7;
+        if (iso <= 3200) return 1.2;
+        return 2;
+      }
+
+      function App() {
+        const [model, setModel] = useState("P4P");
+        const cam = CAMERAS[model];
+        const [gsdCm, setGsdCm] = useState(0.5);
+        const [aperture, setAperture] = useState(5.6);
+        const [shutter, setShutter] = useState("1/1000");
+        const [illum, setIllum] = useState("Soleado (sombras definidas)");
+        const [customEV, setCustomEV] = useState(15);
+
+        const t = useMemo(() => parseShutter(shutter), [shutter]);
+        const N = useMemo(() => (model === "M3M_MS" ? CAMERAS.M3M_MS.fixedF : aperture), [model, aperture]);
+        const ev100 = illum === "Personalizado" ? customEV : EV100_PRESETS[illum];
+
+        const H = useMemo(() => heightFromGSD(gsdCm, cam), [gsdCm, cam]);
+        const iso = useMemo(() => recommendedISO(N, t, ev100), [N, t, ev100]);
+        const evComp = useMemo(() => evCompSuggestion(N, t, ev100, true), [N, t, ev100]);
+        const vmax = useMemo(() => maxSpeedForBlur(gsdCm, t, 1/3), [gsdCm, t]);
+
+        const score = useMemo(() => {
+          const sA = apertureScore(N, cam);
+          const sS = shutterScore(vmax);
+          const base = 0.6 * sA + 0.4 * sS;
+          return clamp(base - isoPenalty(iso), 1, 10);
+        }, [N, vmax, iso, cam]);
+
+        const wb = useMemo(() => {
+          switch (illum) {
+            case "Nieve/Arena sol fuerte": return "Sunny (≈ 5500K)";
+            case "Soleado (sombras definidas)": return "Sunny (≈ 5500K)";
+            case "Soleado con bruma": return "Sunny/Cloudy (≈ 5600–6000K)";
+            case "Nublado brillante (sin sombras)": return "Cloudy (≈ 6000–6500K)";
+            case "Nublado espeso / sombra": return "Shade (≈ 7000–7500K)";
+            case "Amanecer/Atardecer": return "Shade/Warm (≈ 6500–8000K)";
+            default: return "Sunny";
+          }
+        }, [illum]);
+
+        const aspect = cam.aspect;
+        const overlap = model === "M3M_MS" ? { front: 85, side: 80 } : { front: 80, side: 80 };
+        const focusMethod = model === "M3M_MS" ? "Enfoque fijo (MS) + RGB en infinito/hiperfocal (bloquear)" : "Manual en Infinito / Hiperfocal (bloquear AF)";
+
+        return (
+          <div className="min-h-screen w-full bg-slate-50 text-slate-900 p-6">
+            <div className="max-w-5xl mx-auto">
+              <h1 className="text-2xl md:text-3xl font-bold mb-2">Planificador de vuelo y cámara</h1>
+              <p className="text-sm md:text-base text-slate-600 mb-6">
+                Drones: DJI Phantom 4 Pro · DJI Mavic 3 Multispectral (RGB y MS). Introduce GSD, obturación, apertura y condición de luz.
+                Calcula ISO, EV, enfoque, velocidad máx. sin trepidación, altura AGL, solapes, WB, relación de aspecto e índice de calidad (1–10).
+              </p>
+
+              <div className="grid md:grid-cols-2 gap-4 mb-6">
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <label className="block text-sm font-medium mb-1">Modelo de drone</label>
+                  <select value={model} onChange={(e)=>setModel(e.target.value)} className="w-full rounded-xl border p-2">
+                    <option value="P4P">DJI Phantom 4 Pro (RGB)</option>
+                    <option value="M3M_RGB">DJI Mavic 3 Multispectral (RGB)</option>
+                    <option value="M3M_MS">DJI Mavic 3 Multispectral (Multiespectral)</option>
+                  </select>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <label className="block text-sm font-medium mb-1">GSD objetivo (cm/px)</label>
+                  <input type="number" step="0.01" value={gsdCm} onChange={(e)=>setGsdCm(parseFloat(e.target.value)||0)} className="w-full rounded-xl border p-2" />
+                  <p className="text-xs text-slate-500 mt-1">Ej.: 0.5 cm/px</p>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <label className="block text-sm font-medium mb-1">Velocidad de obturación</label>
+                  <div className="flex gap-2">
+                    <select value={shutter} onChange={(e)=>setShutter(e.target.value)} className="flex-1 rounded-xl border p-2">
+                      {SHUTTER_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                    <span className="text-xs text-slate-500 self-center">≈ {formatShutterSeconds(parseShutter(shutter))}</span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1">Rango típico 1/30–1/8000 (mecánico hasta ≈1/2000). Para cartografía, 1/1000–1/2000 suele equilibrar nitidez y ruido.</p>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <label className="block text-sm font-medium mb-1">Apertura (f/)</label>
+                  <select value={model === "M3M_MS" ? 2.0 : aperture} onChange={(e)=>setAperture(parseFloat(e.target.value)||2.8)} className="w-full rounded-xl border p-2" disabled={model==="M3M_MS"}>
+                    {apertureListFor(model).map(f => <option key={f} value={f}>{`f/${f}`}</option>)}
+                  </select>
+                  {model==="M3M_MS" && (
+                    <p className="text-xs text-slate-500 mt-1">MS es f/2.0 fijo</p>
+                  )}
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-4 md:col-span-2">
+                  <label className="block text-sm font-medium mb-1">Iluminación del día</label>
+                  <div className="grid md:grid-cols-2 gap-2">
+                    <select value={illum} onChange={(e)=>setIllum(e.target.value)} className="rounded-xl border p-2">
+                      {Object.keys(EV100_PRESETS).map(k=> <option key={k} value={k}>{k}</option>)}
+                      <option value="Personalizado">Personalizado (EV100)</option>
+                    </select>
+                    {illum === "Personalizado" && (
+                      <input type="number" step="0.1" value={customEV} onChange={(e)=>setCustomEV(parseFloat(e.target.value)||12)} className="rounded-xl border p-2" />
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1">Basado en tabla EV (ISO 100). Soleado ≈ EV15; nublado brillante ≈ EV13; nublado espeso ≈ EV12…</p>
+                </div>
+              </div>
+
+              <div className="grid lg:grid-cols-3 gap-4 mb-6">
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <h2 className="font-semibold mb-2">Exposición</h2>
+                  <div className="text-sm space-y-1">
+                    <div><span className="font-medium">ISO sugerido:</span> {Math.round(iso)}</div>
+                    <div><span className="font-medium">Compensación EV (auto):</span> {evComp>0?`+${evComp.toFixed(2)}`:evComp.toFixed(2)} EV</div>
+                    <div><span className="font-medium">WB (bloquear):</span> {wb}</div>
+                    <div><span className="font-medium">Relación de aspecto:</span> {aspect}</div>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <h2 className="font-semibold mb-2">Vuelo</h2>
+                  <div className="text-sm space-y-1">
+                    <div><span className="font-medium">Altura AGL:</span> {H.toFixed(2)} m</div>
+                    <div><span className="font-medium">Velocidad máx. sin trepidación (1/3 px):</span> {vmax.toFixed(2)} m/s ({(vmax*3.6).toFixed(1)} km/h)</div>
+                    <div><span className="font-medium">Solapes recomendados:</span> {overlap.front}% frontal · {overlap.side}% lateral</div>
+                    <div><span className="font-medium">Método de enfoque:</span> {focusMethod}</div>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-4">
+                  <h2 className="font-semibold mb-2">Índice de calidad</h2>
+                  <div className="text-sm">Escala 1–10 (mayor es mejor). Muy sensible a apertura y obturación; prioriza nitidez y PDC.</div>
+                  <div className="mt-3 h-10 w-full bg-slate-100 rounded-xl overflow-hidden">
+                    <div className="h-full bg-emerald-500" style={{width: `${(score*10)}%`}}></div>
+                  </div>
+                  <div className="mt-2 text-3xl font-bold">{score.toFixed(1)}</div>
+                  <div className="text-xs text-slate-500 mt-1">Consejo: cierra hacia f/{cam.sweetSpotF} y usa obturación rápida para subir la puntuación.</div>
+                </div>
+              </div>
+
+              <details className="bg-white rounded-2xl shadow p-4">
+                <summary className="cursor-pointer font-semibold">Ver fórmulas y supuestos</summary>
+                <div className="text-sm text-slate-700 mt-2 space-y-2">
+                  <p><strong>Altura AGL</strong> — P4P/M3M RGB: GSD = H × (paso_pix / f). M3M MS: H = (GSD × ancho_px) / [2 × tan(FOV_h/2)].</p>
+                  <p><strong>ISO sugerido</strong> — ISO = 100 × (N²/t) / 2^EV100.</p>
+                  <p><strong>EV (auto)</strong> — EV_comp = (EV100 - log2(N²/t)) − 0.3 (leve subexposición recomendada).</p>
+                  <p><strong>Velocidad sin trepidación</strong> — v_max = (GSD × 1/3 px) / t. Regla conservadora 1/3 px.</p>
+                  <p><strong>Índice</strong> — 60% apertura (pico en f/{cam.sweetSpotF}), 40% obturación (mejor cuanto mayor v_max), penalización suave por ISO alto.</p>
+                </div>
+              </details>
+
+              <div className="mt-6 text-xs text-slate-500">
+                Nota: WB fijo, AF continuo desactivado; bloquea enfoque en infinito/hiperfocal antes de la misión. Para cultivos planos: 80/80 de solape; en vegetación densa: 85/70–85/85.
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<App />);
+    </script>
+  </body>
+</html>
+"""
+path = "/mnt/data/Planificador_Fotogrametria_DJI.html"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(html_content)
+print(f"Archivo regenerado en: {path}")
